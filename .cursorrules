@@ -1,0 +1,68 @@
+# CRAIC 2026 仿真赛项目规则
+
+## 项目概述
+这是一个2026年CRAIC人形机器人仿真挑战赛的任务模板项目，基于ROS和MuJoCo仿真环境。
+
+## 代码结构
+- `scripts/`: 包含场景执行脚本和核心功能模块
+- `skills/`: 包含可重用的技能模块，提供ROS接口封装、导航工具和感知工具
+- `README.md`: 项目文档和比赛说明
+
+## 重要约束
+1. **允许修改范围**: 仅 `src/craic_task_template` 内的 README、脚本和辅助模块
+2. **允许使用传感器**: `/odom`、`/lidar/points`、`/tag_detections`、头部相机按钮识别
+3. **禁止使用接口**: `/ground_truth/state` 和任何运行时真值状态
+4. **导航原则**: 阶段顺序是已知任务指令，具体移动由 AprilTag 锚点、局部雷达地图和相对行程共同决定
+
+## 代码风格
+- 使用Python 3.8+
+- 遵循PEP 8代码规范
+- 类型注解（Type Hints）
+- 详细的文档字符串
+
+## 常用接口
+- 速度控制: `/cmd_vel` (geometry_msgs/Twist)
+- 手臂控制: `/kuavo_arm_traj` (sensor_msgs/JointState)
+- 夹爪控制: `/gripper/command` (sensor_msgs/JointState)
+- 控制器切换: `/humanoid_controller/switch_controller`
+
+## Skills模块
+- `LidarMapper`: 激光雷达局部建图，提供扇区clearance和避障信息
+- `ButtonDetector`: 按钮颜色检测，支持HSV颜色空间分析
+- `Localizer`: 相对里程计和AprilTag语义锚点定位
+- `ControllerManager`: MPC/AMP控制器切换和管理
+- `NavigationUtils`: 导航计算工具（距离、角度、路径平滑）
+- `PerceptionUtils`: 感知工具（点云处理、障碍物提取）
+- `ROSInterface`: ROS接口封装（速度、手臂、夹爪控制）
+- `CompetitionRequirements`: 比赛要求封装（规则、提交验证、严禁事项）
+
+## 传感器数据
+- 激光雷达: `/lidar/points` (sensor_msgs/PointCloud2)
+- 摄像头: `/cam_h/color/image_raw/compressed`, `/cam_l/color/image_raw/compressed`, `/cam_r/color/image_raw/compressed`
+- 深度摄像头: `/cam_h/depth/image_raw/compressedDepth`, `/cam_l/depth/image_rect_raw/compressedDepth`, `/cam_r/depth/image_rect_raw/compressedDepth`
+- AprilTag检测: `/tag_detections`
+- 里程计: `/odom`
+
+## 开发建议
+1. 使用 `skills` 模块中的工具类，避免重复造轮子
+2. 优先使用相对定位和局部感知，避免依赖全局坐标
+3. 实现鲁棒的导航策略，处理传感器噪声和定位失败
+4. 多seed测试，确保算法的泛化能力
+
+## 调试技巧
+1. 固定seed运行: `python3 scripts/scene1_patrol.py --seed 0`
+2. 查看ROS话题: `rostopic list`, `rostopic echo /topic_name`
+3. 可视化点云: `rviz` 或 `rosrun rviz rviz`
+4. 查看日志: `rosout` 或直接查看终端输出
+
+## 测试方法
+1. 单元测试: 对每个模块进行独立测试
+2. 集成测试: 测试整个场景的执行流程
+3. 性能测试: 评估算法的实时性和准确性
+4. 鲁棒性测试: 不同seed和环境条件下的表现
+
+## 文档要求
+- 每个模块必须有详细的文档字符串
+- 复杂算法需要添加注释说明
+- 更新README.md记录重要的修改和新增功能
+- 提交代码时附带清晰的提交信息
