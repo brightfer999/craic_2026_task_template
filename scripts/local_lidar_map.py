@@ -29,6 +29,51 @@ class Clearance:
     has_data: bool
 
 
+@dataclass
+class ConeCluster:
+    x: float
+    y: float
+    distance: float
+    radius: float
+    point_count: int
+    side: str
+
+
+@dataclass
+class WallEstimate:
+    side: str
+    score: float
+    min_distance: float
+    mean_distance: float
+    angle: float
+    length: float
+    point_count: int
+
+
+@dataclass
+class GapTarget:
+    has_gap: bool
+    angle: float
+    lateral_offset: float
+    width: float
+    clearance: float
+    front_clearance: float
+
+
+@dataclass
+class ConfirmedCone:
+    cone: ConeCluster
+    confidence: float
+    frames_seen: int
+
+
+@dataclass
+class ConfirmedWall:
+    wall: WallEstimate
+    confidence: float
+    frames_seen: int
+
+
 def _quat_xyzw_to_rotation_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
     """Unit quaternion x,y,z,w to 3x3 rotation matrix."""
     xx, yy, zz = qx * qx, qy * qy, qz * qz
@@ -88,6 +133,13 @@ class LocalLidarMapper:
 
         self._warned_tf = False
         self._ema_state: Optional[Clearance] = None
+
+        # 多帧确认历史缓冲区
+        self._history_size = int(rospy.get_param("~detection_history_size", 5))
+        self._confirmation_threshold = int(rospy.get_param("~detection_confirmation_threshold", 3))
+        self._cone_history: List[List[ConeCluster]] = []
+        self._wall_history: List[List[WallEstimate]] = []
+        self._wall_sectors_cache: List[str] = []
 
     def _cloud_callback(self, msg):
         with self._lock:
@@ -317,6 +369,326 @@ class LocalLidarMapper:
             clusters.append(cluster)
         return clusters
 
+    @staticmethod
+    def _cluster_shape(
+        pts: List[Tuple[float, float, float]],
+    ) -> Tuple[float, float, float, float, float]:
+        """Return centroid x/y, radial distance, max radius and xy span."""
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+        radius = max(math.hypot(x - cx, y - cy) for x, y, _z in pts)
+        span = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        return cx, cy, math.hypot(cx, cy), radius, span
+
+    def detect_cones(
+        self,
+        cone_diameter: float = 0.15,
+        cone_min_points: int = 3,
+        angle_min: float = math.radians(-125),
+        angle_max: float = math.radians(125),
+        max_distance: float = 2.6,
+        exclude_wall_sectors: Optional[List[str]] = None,
+    ) -> List[ConeCluster]:
+        """Detect compact discrete clusters that behave like traffic cones."""
+        # 互斥分类：排除已被识别为墙壁的扇区
+        wall_sector_angles = {
+            "left": (math.radians(25), math.radians(125)),
+            "right": (math.radians(-125), math.radians(-25)),
+            "front": (math.radians(-35), math.radians(35)),
+        }
+        
+        points = []
+        for p in self._sector_filtered_points(angle_min, angle_max):
+            if not (0.18 <= math.hypot(p[0], p[1]) <= max_distance):
+                continue
+            
+            # 检查该点是否在墙壁扇区内
+            if exclude_wall_sectors:
+                point_angle = math.atan2(p[1], p[0])
+                in_wall_sector = False
+                for sector in exclude_wall_sectors:
+                    if sector in wall_sector_angles:
+                        lo, hi = wall_sector_angles[sector]
+                        if lo <= point_angle <= hi:
+                            in_wall_sector = True
+                            break
+                if in_wall_sector:
+                    continue
+            
+            points.append(p)
+        
+        if len(points) < cone_min_points:
+            return []
+        if len(points) > 420:
+            step = int(math.ceil(len(points) / 420.0))
+            points = points[::step]
+
+        cluster_radius = max(0.18, cone_diameter * 1.6)
+        cones: List[ConeCluster] = []
+        for cluster in self._cluster_by_distance(points, cluster_radius):
+            if len(cluster) < cone_min_points:
+                continue
+            cx, cy, dist, radius, span = self._cluster_shape(cluster)
+            if span > 0.55 or radius > 0.32:
+                continue
+            side = "left" if cy >= 0.0 else "right"
+            cones.append(
+                ConeCluster(
+                    x=cx,
+                    y=cy,
+                    distance=dist,
+                    radius=max(radius, cone_diameter * 0.5),
+                    point_count=len(cluster),
+                    side=side,
+                )
+            )
+        cones.sort(key=lambda c: c.distance)
+        return cones
+
+    @staticmethod
+    def _fit_line_estimate(
+        pts: List[Tuple[float, float, float]],
+    ) -> Tuple[float, float, float]:
+        """PCA line estimate: heading angle, segment length and mean residual."""
+        if len(pts) < 2:
+            return 0.0, 0.0, float("inf")
+        arr = np.asarray([(x, y) for x, y, _z in pts], dtype=np.float64)
+        center = np.mean(arr, axis=0)
+        centered = arr - center
+        _vals, vecs = np.linalg.eigh(centered.T @ centered)
+        direction = vecs[:, -1]
+        projections = centered @ direction
+        length = float(np.max(projections) - np.min(projections))
+        normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+        residual = float(np.mean(np.abs(centered @ normal)))
+        angle = math.atan2(float(direction[1]), float(direction[0]))
+        return angle, length, residual
+
+    def detect_walls(self) -> List[WallEstimate]:
+        """Detect continuous side-wall structures and reject sparse cone clusters."""
+        walls: List[WallEstimate] = []
+        wall_sectors = []
+        sectors = (
+            ("left", math.radians(25), math.radians(125)),
+            ("right", math.radians(-125), math.radians(-25)),
+            ("front", math.radians(-35), math.radians(35)),
+        )
+        for side, lo, hi in sectors:
+            pts = self._sector_filtered_points(lo, hi)
+            pts = [p for p in pts if math.hypot(p[0], p[1]) <= self.max_range]
+            count, min_d, mean_d, std_d = self._distance_stats(pts)
+            if count < 10:
+                continue
+            angle, length, residual = self._fit_line_estimate(pts)
+            count_factor = min(1.0, count / 60.0)
+            length_factor = min(1.0, length / 0.9)
+            residual_factor = 1.0 / (1.0 + residual * 18.0 + std_d * 0.6)
+            score = count_factor * length_factor * residual_factor
+            if score < 0.20:
+                continue
+            walls.append(
+                WallEstimate(
+                    side=side,
+                    score=score,
+                    min_distance=min_d,
+                    mean_distance=mean_d,
+                    angle=angle,
+                    length=length,
+                    point_count=count,
+                )
+            )
+            wall_sectors.append(side)
+        
+        # 更新墙壁扇区缓存
+        self._wall_sectors_cache = wall_sectors
+        
+        # 更新墙壁历史缓冲区
+        self._wall_history.append(walls)
+        if len(self._wall_history) > self._history_size:
+            self._wall_history.pop(0)
+        
+        return walls
+
+    def detect_cones_with_exclusion(
+        self,
+        cone_diameter: float = 0.15,
+        cone_min_points: int = 3,
+        angle_min: float = math.radians(-125),
+        angle_max: float = math.radians(125),
+        max_distance: float = 2.6,
+    ) -> List[ConeCluster]:
+        """检测锥桶，自动排除已被识别为墙壁的扇区。"""
+        return self.detect_cones(
+            cone_diameter=cone_diameter,
+            cone_min_points=cone_min_points,
+            angle_min=angle_min,
+            angle_max=angle_max,
+            max_distance=max_distance,
+            exclude_wall_sectors=self._wall_sectors_cache,
+        )
+
+    def get_confirmed_cones(
+        self,
+        cone_diameter: float = 0.15,
+        cone_min_points: int = 3,
+        angle_min: float = math.radians(-125),
+        angle_max: float = math.radians(125),
+        max_distance: float = 2.6,
+    ) -> List[ConfirmedCone]:
+        """获取经过多帧确认的锥桶检测结果。"""
+        current_cones = self.detect_cones_with_exclusion(
+            cone_diameter=cone_diameter,
+            cone_min_points=cone_min_points,
+            angle_min=angle_min,
+            angle_max=angle_max,
+            max_distance=max_distance,
+        )
+        
+        # 更新锥桶历史缓冲区
+        self._cone_history.append(current_cones)
+        if len(self._cone_history) > self._history_size:
+            self._cone_history.pop(0)
+        
+        if len(self._cone_history) < self._confirmation_threshold:
+            return []
+        
+        # 统计每个锥桶在历史帧中出现的次数
+        confirmed_cones = []
+        for cone in current_cones:
+            frames_seen = 0
+            for historical_cones in self._cone_history:
+                for hist_cone in historical_cones:
+                    # 检查是否是同一个锥桶（基于位置接近性）
+                    distance = math.hypot(cone.x - hist_cone.x, cone.y - hist_cone.y)
+                    if distance < 0.3:  # 30cm 内认为是同一个锥桶
+                        frames_seen += 1
+                        break
+            
+            if frames_seen >= self._confirmation_threshold:
+                confidence = frames_seen / len(self._cone_history)
+                confirmed_cones.append(ConfirmedCone(
+                    cone=cone,
+                    confidence=confidence,
+                    frames_seen=frames_seen,
+                ))
+        
+        return confirmed_cones
+
+    def get_confirmed_walls(self) -> List[ConfirmedWall]:
+        """获取经过多帧确认的墙壁检测结果。"""
+        if len(self._wall_history) < self._confirmation_threshold:
+            return []
+        
+        # 统计每个墙壁扇区在历史帧中出现的次数
+        wall_counts = {}
+        for historical_walls in self._wall_history:
+            for wall in historical_walls:
+                if wall.side not in wall_counts:
+                    wall_counts[wall.side] = {
+                        "count": 0,
+                        "wall": wall,
+                        "scores": [],
+                    }
+                wall_counts[wall.side]["count"] += 1
+                wall_counts[wall.side]["scores"].append(wall.score)
+        
+        confirmed_walls = []
+        for side, data in wall_counts.items():
+            if data["count"] >= self._confirmation_threshold:
+                confidence = data["count"] / len(self._wall_history)
+                avg_score = sum(data["scores"]) / len(data["scores"])
+                # 使用最新的墙壁数据，但用平均分数
+                latest_wall = data["wall"]
+                confirmed_wall = WallEstimate(
+                    side=latest_wall.side,
+                    score=avg_score,
+                    min_distance=latest_wall.min_distance,
+                    mean_distance=latest_wall.mean_distance,
+                    angle=latest_wall.angle,
+                    length=latest_wall.length,
+                    point_count=latest_wall.point_count,
+                )
+                confirmed_walls.append(ConfirmedWall(
+                    wall=confirmed_wall,
+                    confidence=confidence,
+                    frames_seen=data["count"],
+                ))
+        
+        return confirmed_walls
+
+    def find_best_gap(
+        self,
+        angle_limit: float = math.radians(75),
+        bin_count: int = 61,
+        lookahead: float = 2.2,
+        safety_radius: float = 0.38,
+        preferred_angle: float = 0.0,
+    ) -> GapTarget:
+        """Choose a forward free-space gap; cones and walls are both obstacles."""
+        points = [
+            p for p in self.get_points()
+            if 0.18 <= math.hypot(p[0], p[1]) <= lookahead
+            and -angle_limit <= math.atan2(p[1], p[0]) <= angle_limit
+        ]
+        front_clearance = self.max_range
+        for x, y, _z in points:
+            a = math.atan2(y, x)
+            if abs(a) <= math.radians(15):
+                front_clearance = min(front_clearance, math.hypot(x, y))
+
+        if bin_count < 5:
+            bin_count = 5
+        angles = np.linspace(-angle_limit, angle_limit, bin_count)
+        clearances = [lookahead for _ in range(bin_count)]
+
+        for x, y, _z in points:
+            dist = math.hypot(x, y)
+            angle = math.atan2(y, x)
+            if dist <= 0.001:
+                continue
+            spread = min(math.radians(28), math.asin(min(0.95, safety_radius / dist)))
+            for idx, ray_angle in enumerate(angles):
+                if abs(ray_angle - angle) <= spread:
+                    clearances[idx] = min(clearances[idx], dist)
+
+        free = [c >= max(0.55, safety_radius * 1.45) for c in clearances]
+        gaps: List[Tuple[int, int]] = []
+        start = None
+        for idx, ok in enumerate(free):
+            if ok and start is None:
+                start = idx
+            elif not ok and start is not None:
+                gaps.append((start, idx - 1))
+                start = None
+        if start is not None:
+            gaps.append((start, len(free) - 1))
+
+        if not gaps:
+            idx = int(np.argmax(clearances))
+            angle = float(angles[idx])
+            return GapTarget(False, angle, math.sin(angle) * clearances[idx], 0.0,
+                             float(clearances[idx]), float(front_clearance))
+
+        best = None
+        best_score = -float("inf")
+        for lo, hi in gaps:
+            center_idx = (lo + hi) // 2
+            center_angle = float(angles[center_idx])
+            width = float(angles[hi] - angles[lo])
+            clearance = min(clearances[lo:hi + 1])
+            forward_score = math.cos(center_angle)
+            preference_penalty = abs(center_angle - preferred_angle)
+            score = width * 1.8 + clearance * 0.8 + forward_score - preference_penalty * 0.9
+            if score > best_score:
+                best_score = score
+                best = (center_angle, width, clearance)
+
+        angle, width, clearance = best
+        return GapTarget(True, angle, math.sin(angle) * min(clearance, lookahead),
+                         width, clearance, float(front_clearance))
+
     def left_wall_info(self) -> Tuple[float, float, float, float]:
         """Analyze left side (18°–120°) for wall-like structure.
 
@@ -399,19 +771,14 @@ class LocalLidarMapper:
         """Use wall/cone asymmetry to judge correct forward direction.
 
         Returns:
-            1.0  – correct orientation (left=wall, right=cones)
-           -1.0  – facing backwards (right=wall, left=cones)
+            1.0  – correct orientation (right=wall, left=cones) for right-wall-following
+           -1.0  – facing backwards (left=wall, right=cones)
             0.0  – uncertain
         """
         left_score = self.wall_score_left()
         right_score = self.wall_score_right()
-        cone_dist_right, num_cones_right, _ = self.right_cone_info(cone_diameter, cone_min_points)
 
-        left_is_wall = left_score > wall_threshold
-        right_has_cones = num_cones_right > 0
-        if left_is_wall and right_has_cones:
-            return 1.0
-
+        # Check right wall + left cones → correct direction
         right_is_wall = right_score > wall_threshold
         pt_left = self._sector_filtered_points(math.radians(18), math.radians(120))
         clusters_left = self._cluster_by_distance(pt_left, cone_diameter)
@@ -419,6 +786,14 @@ class LocalLidarMapper:
         left_has_cones = len(cones_left) > 0
 
         if right_is_wall and left_has_cones:
+            return 1.0
+
+        # Check left wall + right cones → facing backwards
+        left_is_wall = left_score > wall_threshold
+        cone_dist_right, num_cones_right, _ = self.right_cone_info(cone_diameter, cone_min_points)
+        right_has_cones = num_cones_right > 0
+
+        if left_is_wall and right_has_cones:
             return -1.0
 
         return 0.0

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.8
 """Semantic scene-1 directives for perception-driven patrol.
 
 This file intentionally avoids absolute route coordinates. It only describes

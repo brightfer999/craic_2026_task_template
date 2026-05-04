@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.8
 """
 场景一：安全巡检任务脚本
 
@@ -82,9 +82,8 @@ def main():
     result = patrol.run()
 
     if patrol.traverser.no_cone_abort:
-        rospy.logwarn("巡逻因无锥桶掉头，执行 180° 掉头后重试")
-        patrol.traverser.perform_u_turn()
-        result = patrol.run()
+        rospy.logwarn("Obstacle U-turn retry disabled; keep current forward direction")
+        patrol.traverser.no_cone_abort = False
 
     rospy.loginfo(
         "场景一主任务完成=%s，用时=%.1fs，失败阶段=%s",

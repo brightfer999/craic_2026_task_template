@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.8
 
 import math
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import rospy
 from geometry_msgs.msg import Twist
@@ -40,6 +40,9 @@ class TerrainTraverser:
         self._CONE_DIAMETER = float(rospy.get_param("~cone_diameter", 0.15))
         self._CONE_MIN_POINTS = int(rospy.get_param("~cone_min_points", 3))
         self._CONE_SAFE_DIST = float(rospy.get_param("~cone_safe_distance", 0.50))
+        self._SIDE_SAFE_DIST = float(rospy.get_param("~side_safe_distance", 0.42))
+        self._FRONT_STOP_DIST = float(rospy.get_param("~front_stop_distance", 0.36))
+        self._FRONT_BACKOFF_DIST = float(rospy.get_param("~front_backoff_distance", 0.22))
         self._CORNER_DETECT_THRESH = float(rospy.get_param("~corner_detect_threshold", 2.5))
         self._CORNER_TURN_W = float(rospy.get_param("~corner_turn_w", 0.35))
         self._LEFT_CORNER_TURN_W = float(rospy.get_param("~left_corner_turn_w", 0.35))
@@ -49,6 +52,11 @@ class TerrainTraverser:
         self._SPARSITY_THRESH = float(rospy.get_param("~sparsity_threshold", 0.35))
         self._MAX_TURN_ANGLE = math.radians(float(rospy.get_param("~max_turn_angle_deg", 126.0)))
         self._initial_yaw = None
+        self._OBSTACLE_MAX_YAW = math.radians(float(rospy.get_param("~obstacle_max_yaw_deg", 55.0)))
+        self._OBSTACLE_YAW_KP = float(rospy.get_param("~obstacle_yaw_kp", 0.70))
+        self._GAP_LOOKAHEAD = float(rospy.get_param("~obstacle_gap_lookahead", 2.2))
+        self._GAP_SAFETY_RADIUS = float(rospy.get_param("~obstacle_gap_safety_radius", 0.40))
+        self._WALL_GUARD_DIST = float(rospy.get_param("~obstacle_wall_guard_distance", 0.36))
 
         # ====== 锥桶看门狗：巡逻中未发现锥桶则掉头 ======
         self._cones_confirmed = False
@@ -70,6 +78,7 @@ class TerrainTraverser:
         cmd = Twist()
         cmd.angular.z = clamp(angular_z, -0.5, 0.0)
 
+        _last_watchdog = time.time()
         while not rospy.is_shutdown() and time.time() < deadline:
             self._cmd_pub.publish(cmd)
             rate.sleep()
@@ -80,24 +89,66 @@ class TerrainTraverser:
                 _last_watchdog = time.time()
 
         self.stop()
-        rospy.logwarn(
-            "%s timed out after %.1fm, saw_tag=%s",
-            stage.name,
-            self._localizer.distance_since_stage_reset(),
-            saw_tag,
+        return None
+
+    def explore_and_detect_obstacles(self) -> None:
+        rospy.loginfo("=== 探索并检测障碍物 ===")
+
+        clearance = self._lidar.clearance()
+        if not clearance.has_data:
+            rospy.logwarn("No lidar data for obstacle exploration")
+            return
+
+        rospy.loginfo(
+            "Clearance: front=%.2f lf=%.2f rf=%.2f left=%.2f right=%.2f",
+            clearance.front, clearance.left_front, clearance.right_front,
+            clearance.left, clearance.right,
         )
-        return saw_tag or self._localizer.distance_since_stage_reset() >= 0.7 * stage.nominal_distance
+
+        dist_l, num_l, _ = self._lidar.left_cone_info(
+            cone_diameter=self._CONE_DIAMETER,
+            cone_min_points=self._CONE_MIN_POINTS,
+            sparsity_threshold=self._SPARSITY_THRESH,
+        )
+        dist_r, num_r, _ = self._lidar.right_cone_info(
+            cone_diameter=self._CONE_DIAMETER,
+            cone_min_points=self._CONE_MIN_POINTS,
+            sparsity_threshold=self._SPARSITY_THRESH,
+        )
+
+        if num_l > 0 or num_r > 0:
+            self._cones_confirmed = True
+            rospy.loginfo("Cones found: L=%d(%.2fm) R=%d(%.2fm)", num_l, dist_l, num_r, dist_r)
+        else:
+            rospy.loginfo("No cones in immediate surroundings")
+
+        if clearance.front < 0.5:
+            rospy.logwarn("Nearby obstacle in front (%.2fm)", clearance.front)
+            self.obstacle_hit_count += 1
+
+    def run_stage(self, stage: StageDirective, reverse: bool = False) -> bool:
+        """Run a stage directive by dispatching to the appropriate method."""
+        self.reset_cone_tracking()
+        if stage.name == "obstacle":
+            return self.cross_obstacle_zone(stage, reverse=reverse)
+        elif stage.name in ("operator_1", "operator_2"):
+            return self.press_panel(stage.name)
+        elif stage.name == "terrain":
+            return self.follow_corridor(stage, reverse=reverse)
+        else:
+            return self.follow_corridor(stage, reverse=reverse)
 
     def cross_obstacle_zone(self, stage: StageDirective, reverse: bool = False) -> bool:
         self._localizer.reset_stage_progress()
-        self._initial_yaw = None  # 重置累计转弯角度跟踪
+        self._initial_yaw = self._localizer.yaw_since_stage_reset()
+        self.no_cone_abort = False
         start = time.time()
-        direction = -1.0 if reverse else 1.0
+        direction = 1.0
+        if reverse:
+            rospy.logwarn("Obstacle zone reverse requested; using forward-locked gap following")
         self._run_lidar_warmup_gate(direction)
-        motion_t0 = time.time()
         rate = rospy.Rate(20)
-        blend_motion = True
-        _last_watchdog = time.time()
+        _last_log = time.time()
 
         while not rospy.is_shutdown() and time.time() - start < stage.timeout:
             travelled = self._localizer.distance_since_stage_reset()
@@ -109,24 +160,16 @@ class TerrainTraverser:
             if clearance.has_data and clearance.front < 0.42:
                 self.obstacle_hit_count += 1
 
-            la_scale, yz_scale = self._lateral_angular_blend(time.time() - motion_t0, blend_motion)
-            cmd = self._reactive_cmd(
+            cmd = self._cone_zone_gap_follow_cmd(
                 stage.speed,
-                direction,
-                stage.corridor_bias,
-                lateral_scale=la_scale,
-                angular_scale=yz_scale,
-                reverse=reverse,
+                lateral_scale=1.0,
+                angular_scale=1.0,
             )
-            if clearance.has_data and clearance.front < 0.75:
-                cmd.linear.x = clamp(cmd.linear.x, -0.08, 0.08)
             self._cmd_pub.publish(cmd)
             rate.sleep()
-            if time.time() - _last_watchdog >= 0.8:
-                if self._check_cones_watchdog():
-                    self.stop(0.3)
-                    return False
-                _last_watchdog = time.time()
+            if time.time() - _last_log >= 1.0:
+                self._log_obstacle_perception()
+                _last_log = time.time()
 
         self.stop()
         rospy.logwarn(
@@ -137,6 +180,48 @@ class TerrainTraverser:
 
     def follow_corridor(self, stage: StageDirective, reverse: bool = False) -> bool:
         return self.advance_until_tag_or_distance(stage, reverse=reverse, stop_on_tag=False)
+
+    def advance_until_tag_or_distance(
+        self, stage: StageDirective, reverse: bool = False, stop_on_tag: bool = False
+    ) -> bool:
+        self._localizer.reset_stage_progress()
+        self._initial_yaw = None
+        start = time.time()
+        direction = -1.0 if reverse else 1.0
+        rate = rospy.Rate(20)
+        _last_watchdog = time.time()
+
+        while not rospy.is_shutdown() and time.time() - start < stage.timeout:
+            travelled = self._localizer.distance_since_stage_reset()
+            if travelled >= stage.nominal_distance:
+                self.stop(0.5)
+                return True
+
+            if stop_on_tag and stage.target_tags:
+                if self._localizer.has_seen_tag(stage.target_tags):
+                    self.stop(0.5)
+                    rospy.loginfo("Tag %s detected, stopping", stage.target_tags)
+                    return True
+
+            cmd = self._reactive_cmd(
+                stage.speed, direction, stage.corridor_bias,
+                lateral_scale=1.0, angular_scale=1.0, reverse=reverse,
+            )
+            self._cmd_pub.publish(cmd)
+            rate.sleep()
+
+            if time.time() - _last_watchdog >= 0.8:
+                if self._check_cones_watchdog():
+                    self.stop(0.3)
+                    return False
+                _last_watchdog = time.time()
+
+        self.stop()
+        travelled = self._localizer.distance_since_stage_reset()
+        rospy.logwarn(
+            "advance_until_tag_or_distance timed out after %.1fm", travelled,
+        )
+        return travelled >= 0.65 * stage.nominal_distance
 
     def press_panel(self, panel_name: str) -> bool:
         panel = BUTTON_PANELS[panel_name]
@@ -288,6 +373,157 @@ class TerrainTraverser:
             and clearance.right_front > self._CORNER_DETECT_THRESH * 0.75
         )
 
+    def _lateral_angular_blend(self, elapsed: float, blend_motion: bool) -> Tuple[float, float]:
+        if not blend_motion:
+            return 1.0, 1.0
+        if elapsed >= self._LATERAL_BLEND_SEC:
+            return 1.0, 1.0
+        t = elapsed / self._LATERAL_BLEND_SEC
+        scale = t * t * (3.0 - 2.0 * t)
+        return scale, scale
+
+    def _run_lidar_warmup_gate(self, direction: float) -> None:
+        deadline = time.time() + self._lidar_warmup_timeout
+        rate = rospy.Rate(10)
+        while not rospy.is_shutdown() and time.time() < deadline:
+            if self._lidar.has_data:
+                rospy.loginfo("Lidar warmup gate passed (direction=%.1f)", direction)
+                return
+            rate.sleep()
+        rospy.logwarn("Lidar warmup gate timed out after %.1fs", self._lidar_warmup_timeout)
+
+    def _cone_zone_gap_follow_cmd(
+        self,
+        speed: float,
+        lateral_scale: float = 1.0,
+        angular_scale: float = 1.0,
+    ) -> Twist:
+        """Forward-locked cone-zone navigation using lidar gaps and relative yaw."""
+        cmd = Twist()
+        if not self._lidar.has_data:
+            cmd.linear.x = min(speed, 0.08)
+            return cmd
+
+        if self._initial_yaw is None:
+            self._initial_yaw = self._localizer.yaw_since_stage_reset()
+
+        current_yaw = self._localizer.yaw_since_stage_reset()
+        yaw_delta = normalize_angle(current_yaw - self._initial_yaw)
+        preferred_angle = clamp(-yaw_delta, -math.radians(35), math.radians(35))
+
+        raw = self._lidar.raw_clearance()
+        raw_front = self._lidar.max_range
+        left_space = self._lidar.max_range
+        right_space = self._lidar.max_range
+        if raw.has_data:
+            raw_front = min(raw.front, raw.left_front, raw.right_front)
+            left_space = min(raw.left, raw.left_front)
+            right_space = min(raw.right, raw.right_front)
+
+        gap = self._lidar.find_best_gap(
+            lookahead=self._GAP_LOOKAHEAD,
+            safety_radius=self._GAP_SAFETY_RADIUS,
+            preferred_angle=preferred_angle,
+        )
+        # 使用互斥分类：先检测墙壁，再检测锥桶（排除墙壁区域）
+        walls = self._lidar.detect_walls()
+        cones = self._lidar.detect_cones_with_exclusion(
+            cone_diameter=self._CONE_DIAMETER,
+            cone_min_points=self._CONE_MIN_POINTS,
+        )
+        if cones:
+            self._cones_confirmed = True
+
+        target_angle = gap.angle if gap.has_gap else preferred_angle
+        lateral = clamp(0.42 * gap.lateral_offset, -0.16, 0.16)
+
+        for cone in cones[:4]:
+            if cone.distance > self._CONE_SAFE_DIST:
+                continue
+            push = (self._CONE_SAFE_DIST - cone.distance) / self._CONE_SAFE_DIST
+            if cone.y >= 0.0:
+                lateral -= 0.12 * push
+                target_angle -= math.radians(8) * push
+            else:
+                lateral += 0.12 * push
+                target_angle += math.radians(8) * push
+
+        front_wall_distance = self._lidar.max_range
+        for wall in walls:
+            if wall.side == "front":
+                front_wall_distance = min(front_wall_distance, wall.min_distance)
+            elif wall.side == "left" and wall.min_distance < self._WALL_GUARD_DIST:
+                push = (self._WALL_GUARD_DIST - wall.min_distance) / self._WALL_GUARD_DIST
+                lateral -= 0.18 * push
+                target_angle -= math.radians(10) * push
+            elif wall.side == "right" and wall.min_distance < self._WALL_GUARD_DIST:
+                push = (self._WALL_GUARD_DIST - wall.min_distance) / self._WALL_GUARD_DIST
+                lateral += 0.18 * push
+                target_angle += math.radians(10) * push
+
+        if raw_front < self._FRONT_BACKOFF_DIST:
+            cmd.linear.x = 0.0
+            cmd.linear.y = 0.0
+            cmd.angular.z = clamp(-self._OBSTACLE_YAW_KP * yaw_delta, -0.30, 0.30)
+            rospy.logwarn_throttle(0.8, "Obstacle zone emergency stop %.2fm; no U-turn", raw_front)
+            return cmd
+
+        yaw_locked = abs(yaw_delta) > self._OBSTACLE_MAX_YAW
+        if yaw_locked:
+            cmd.linear.x = 0.04 if raw_front > self._FRONT_STOP_DIST else 0.0
+            cmd.linear.y = clamp(lateral, -0.10, 0.10) * lateral_scale
+            cmd.angular.z = clamp(-self._OBSTACLE_YAW_KP * yaw_delta, -0.30, 0.30) * angular_scale
+            rospy.logwarn_throttle(
+                0.8,
+                "Obstacle yaw recovery %.1f deg; keep forward direction",
+                math.degrees(yaw_delta),
+            )
+            return cmd
+
+        front_clear = min(raw_front, gap.front_clearance, front_wall_distance)
+        if front_clear < self._FRONT_STOP_DIST:
+            vx = 0.02
+        elif front_clear < 0.55:
+            vx = min(speed, 0.07)
+        elif front_clear < 0.90:
+            vx = min(speed, 0.11)
+        else:
+            vx = min(speed, 0.18)
+
+        target_angle = clamp(target_angle, -math.radians(48), math.radians(48))
+        w = 0.85 * target_angle - self._OBSTACLE_YAW_KP * yaw_delta
+        if not gap.has_gap:
+            w *= 0.55
+            vx = min(vx, 0.06)
+
+        cmd.linear.x = clamp(vx, 0.0, min(self._V_MAX, 0.18))
+        cmd.linear.y = clamp(lateral, -0.18, 0.18) * lateral_scale
+        cmd.angular.z = clamp(w, -0.35, 0.35) * angular_scale
+        return cmd
+
+    def _log_obstacle_perception(self) -> None:
+        # 使用互斥分类：先检测墙壁，再检测锥桶（排除墙壁区域）
+        walls = self._lidar.detect_walls()
+        cones = self._lidar.detect_cones_with_exclusion(
+            cone_diameter=self._CONE_DIAMETER,
+            cone_min_points=self._CONE_MIN_POINTS,
+        )
+        gap = self._lidar.find_best_gap(
+            lookahead=self._GAP_LOOKAHEAD,
+            safety_radius=self._GAP_SAFETY_RADIUS,
+        )
+        yaw = 0.0
+        if self._initial_yaw is not None:
+            yaw = normalize_angle(self._localizer.yaw_since_stage_reset() - self._initial_yaw)
+        rospy.loginfo(
+            "Obstacle lidar: cones=%d walls=%s gap=%s angle=%.1f yaw=%.1f",
+            len(cones),
+            ",".join("%s:%.2f" % (w.side, w.score) for w in walls[:3]) or "none",
+            "ok" if gap.has_gap else "blocked",
+            math.degrees(gap.angle),
+            math.degrees(yaw),
+        )
+
     def _reactive_cmd(
         self,
         speed: float,
@@ -314,65 +550,92 @@ class TerrainTraverser:
         has = clearance.has_data
 
         right_wall = clearance.right if has else self._lidar.max_range
-        left_obs = clearance.left if has else self._lidar.max_range
         front_d = clearance.front if has else self._lidar.max_range
+        left_close = min(clearance.left_front, clearance.left) if has else self._lidar.max_range
+        right_close = min(clearance.right_front, clearance.right) if has else self._lidar.max_range
 
         # ========== 1. 右墙跟随 ==========
         wall_err = right_wall - self._WALL_FOLLOW_DISTANCE
         ly = -clamp(self._WALL_FOLLOW_KP_LAT * wall_err, -0.18, 0.18) * lateral_scale
-        w_wall = clamp(-self._WALL_FOLLOW_KP_ANG * wall_err, 0.0, 0.35)
+        w_wall = clamp(-self._WALL_FOLLOW_KP_ANG * wall_err, -0.22, 0.35)
 
-        # ========== 2. 左锥桶/障碍避让 ==========
-        if left_obs < self._CONE_SAFE_DIST:
-            factor = clamp(left_obs / self._CONE_SAFE_DIST, 0.0, 1.0)
-            if w_wall > 0:
-                w_wall *= factor
+        # ========== 2. 侧向锥桶/障碍避让 ==========
+        # 侧向锥桶不应触发原地转圈；保持低速前进，同时向安全侧偏航和侧移。
+        if left_close < self._CONE_SAFE_DIST:
+            avoid = clamp((self._CONE_SAFE_DIST - left_close) / self._CONE_SAFE_DIST, 0.0, 1.0)
+            ly = clamp(ly - 0.12 * avoid * lateral_scale, -0.22, 0.22)
+            w_wall = clamp(w_wall - 0.28 * avoid, -0.45, 0.35)
+        if right_close < self._SIDE_SAFE_DIST:
+            avoid = clamp((self._SIDE_SAFE_DIST - right_close) / self._SIDE_SAFE_DIST, 0.0, 1.0)
+            ly = clamp(ly + 0.10 * avoid * lateral_scale, -0.22, 0.22)
+            w_wall = clamp(w_wall + 0.20 * avoid, -0.45, 0.45)
 
-        # ========== 3. 双拐角检测 ==========
+        # ========== 3. 双级避障（raw clearance 无 EMA 延迟）==========
+        raw_c = self._lidar.raw_clearance()
+        if raw_c.has_data:
+            raw_front_min = min(raw_c.front, raw_c.right_front, raw_c.left_front)
+            raw_side_min = min(raw_c.right, raw_c.left)
+            right_space = min(raw_c.right_front, raw_c.right)
+            left_space = min(raw_c.left_front, raw_c.left)
+        else:
+            raw_front_min = 99.0
+            raw_side_min = 99.0
+            right_space = 99.0
+            left_space = 99.0
+
+        # 提前初始化累计转弯（紧急避障也需受锁限制）
+        if self._initial_yaw is None:
+            self._initial_yaw = self._localizer.yaw_since_stage_reset()
+
+        turn_locked = False
+        current_yaw = self._localizer.yaw_since_stage_reset()
+        yaw_delta = normalize_angle(current_yaw - self._initial_yaw)
+        if abs(yaw_delta) > self._MAX_TURN_ANGLE:
+            turn_locked = True
+            rospy.logwarn_throttle(0.5, "累计转弯超过%.1f°，锁定方向",
+                                   math.degrees(self._MAX_TURN_ANGLE))
+
+        # ========== 4. 双拐角检测 ==========
+        # 只有前方也受限时才按拐角处理，避免把锥桶间隙/侧向开阔误判成转弯口。
         right_corner = self._check_corner(clearance)
         left_corner = self._check_left_corner(clearance)
+        corner_allowed = min(front_d, raw_front_min) < 1.05
 
-        if right_corner:
+        if right_corner and corner_allowed:
             w = self._CORNER_TURN_W
             front_d = min(front_d, 0.45)
             rospy.loginfo_throttle(1.0, "检测到右拐角，执行左转弯(避开场景二) w=%.2f", w)
-        elif left_corner:
-            w = self._LEFT_CORNER_TURN_W
+        elif left_corner and corner_allowed:
+            w = -self._LEFT_CORNER_TURN_W
             front_d = min(front_d, 0.45)
-            rospy.loginfo_throttle(1.0, "检测到左拐角，执行左转弯 w=%.2f", w)
+            rospy.loginfo_throttle(1.0, "检测到左拐角(右侧开阔)，执行右转弯 w=%.2f", w)
         else:
             w = w_wall
 
-        # ========== 3.5. 双级避障（raw clearance 无 EMA 延迟）==========
-        raw_c = self._lidar.raw_clearance()
-        if raw_c.has_data:
-            raw_min = min(raw_c.front, raw_c.right_front, raw_c.left_front,
-                          raw_c.right * 0.6)
-        else:
-            raw_min = 99.0
-
-        if raw_min < 0.20:
-            # 极限：后退 + 猛左转
+        if raw_front_min < self._FRONT_BACKOFF_DIST:
             cmd = Twist()
-            cmd.linear.x = -0.06
+            cmd.linear.x = 0.0 if turn_locked else -0.06
             cmd.linear.y = 0.0
-            cmd.angular.z = 0.50
-            rospy.loginfo_throttle(1.0, "极限避障(%.2fm)，后退+左转", raw_min)
+            if not turn_locked:
+                cmd.angular.z = -0.50 if right_space >= left_space + 0.05 else 0.50
+            rospy.loginfo_throttle(1.0, "极限避障(%.2fm) %s",
+                                   raw_front_min, "已锁定" if turn_locked else "转向安全侧")
             return cmd
 
-        if raw_min < 0.40:
-            # 危险：硬停车 + 猛左转
+        if raw_front_min < self._FRONT_STOP_DIST:
             cmd = Twist()
             cmd.linear.x = 0.0
             cmd.linear.y = 0.0
-            cmd.angular.z = 0.50
-            rospy.loginfo_throttle(1.0, "避障刹车(%.2fm)，停车+左转", raw_min)
+            if not turn_locked:
+                cmd.angular.z = -0.50 if right_space >= left_space + 0.05 else 0.50
+            rospy.loginfo_throttle(1.0, "避障刹车(%.2fm) %s",
+                                   raw_front_min, "已锁定" if turn_locked else "转向安全侧")
             return cmd
 
         # 用 raw 值加速速度衰减（EMA 有延迟）
-        front_d = min(front_d, raw_min)
+        front_d = min(front_d, raw_front_min)
 
-        # ========== 4. 速度衰减（前方越近越慢）==========
+        # ========== 5. 速度衰减（前方越近越慢）==========
         if front_d < 0.45:
             sp_factor = 0.12
         elif front_d < 0.75:
@@ -382,10 +645,12 @@ class TerrainTraverser:
         else:
             sp_factor = 1.0
 
-        if right_corner or left_corner:
+        if (right_corner or left_corner) and corner_allowed:
             sp_factor = min(sp_factor, 0.30)
+        if raw_side_min < self._SIDE_SAFE_DIST:
+            sp_factor = min(sp_factor, 0.45)
 
-        # ========== 5. 三重保险实施 ==========
+        # ========== 6. 三重保险实施 ==========
         vx = speed * direction * sp_factor
         vx = max(vx, 0.0)
         vx = min(vx, self._V_MAX)
@@ -393,15 +658,9 @@ class TerrainTraverser:
         w = clamp(w, -0.50, 0.50)
         w *= angular_scale
 
-        if self._initial_yaw is not None:
-            current_yaw = self._localizer.yaw_since_stage_reset()
-            if abs(current_yaw) > self._MAX_TURN_ANGLE:
-                w = 0.0
-                vx = min(vx, self._V_MAX * 0.5)
-                rospy.logwarn_throttle(0.5, "累计转弯超过%.1f°，锁定方向",
-                                       math.degrees(self._MAX_TURN_ANGLE))
-        else:
-            self._initial_yaw = self._localizer.yaw_since_stage_reset()
+        if turn_locked:
+            w = 0.0
+            vx = min(vx, self._V_MAX * 0.5)
 
         cmd = Twist()
         cmd.linear.x = vx
