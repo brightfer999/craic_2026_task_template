@@ -48,7 +48,7 @@ def main():
 
     rospy.loginfo("=== 场景一：安全巡检任务启动 ===")
     rospy.loginfo("等待 MPC 控制器稳定机器人姿态...")
-    rospy.sleep(8.0)
+    rospy.sleep(18.0)
 
     controller = ControllerManager()
     controller.use_mpc()
@@ -69,7 +69,23 @@ def main():
     )
 
     patrol = PatrolFSM(localizer, controller)
+    patrol.traverser.perform_startup_lidar_rotation()
+    patrol.traverser.perform_startup_lidar_rotation(duration=5.0, angular_z=0.34)
+
+    ok = patrol.traverser.initial_direction_check(timeout=8.0)
+    if not ok:
+        rospy.logwarn("开局方向不确定，请检查环境")
+    else:
+        rospy.loginfo("开局方向确认 OK")
+
+    patrol.traverser.explore_and_detect_obstacles()
     result = patrol.run()
+
+    if patrol.traverser.no_cone_abort:
+        rospy.logwarn("巡逻因无锥桶掉头，执行 180° 掉头后重试")
+        patrol.traverser.perform_u_turn()
+        result = patrol.run()
+
     rospy.loginfo(
         "场景一主任务完成=%s，用时=%.1fs，失败阶段=%s",
         result.completed,

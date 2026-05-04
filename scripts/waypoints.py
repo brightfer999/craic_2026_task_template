@@ -60,6 +60,7 @@ FORWARD_STAGES = [
         nominal_distance=1.8,
         timeout=35.0,
         speed=0.18,
+        corridor_bias=0.15,
         description="Leave the start area by following the clearest lidar corridor.",
     ),
     StageDirective(

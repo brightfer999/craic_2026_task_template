@@ -18,6 +18,8 @@
   <exec_depend>kuavo_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>craic_simulator</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
 
   <export>
   </export>
