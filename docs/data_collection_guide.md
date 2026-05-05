@@ -41,7 +41,25 @@
 
 ## 二、操作环境准备
 
-需要开 **3 个终端窗口**：
+### 进入 Docker 容器
+
+所有操作在 **Docker 容器** 内进行。
+
+```bash
+# 1. 在 WSL 终端中启动 Docker daemon（如未运行）：
+sudo dockerd &
+
+# 2. 在项目根目录启动容器：
+cd ~/leju_kuavo_craic_2026
+./docker/run_with_gpu_for_craic.sh
+
+# 3. 进入容器后，source ROS 环境：
+source /root/kuavo_ws/devel/setup.zsh
+```
+
+> **注意**：3 个终端窗口都需要分别进入 Docker 容器。每个终端执行上述步骤，或通过 `docker exec -it <容器名> bash` 进入已运行的容器。
+
+### 启动 3 个终端
 
 ```
 ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
@@ -248,6 +266,7 @@ python3 scripts/data_collector.py --rate 10 --output data/场景名.npz
 ```
 
 终端会显示保存确认：
+
 ```
   数据已保存: /root/kuavo_ws/.../data/front_blocked.npz  (12.3 MB, 234 帧, 23.4 秒)
 ```

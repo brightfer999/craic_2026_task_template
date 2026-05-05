@@ -70,9 +70,11 @@ def main():
 
     zero_cmd = Twist()
     try:
-        rate = rospy.Rate(20)  # 20Hz，与 keyboard_teleop 同频
+        rate = rospy.Rate(5)  # 低频安全兜底
         while not rospy.is_shutdown():
-            cmd_pub.publish(zero_cmd)
+            # 仅在键盘遥控未接管时发布零速，避免与 keyboard_teleop 竞争
+            if not rospy.get_param('/keyboard_teleop/active', False):
+                cmd_pub.publish(zero_cmd)
             rate.sleep()
     except KeyboardInterrupt:
         rospy.loginfo("  收到停止信号，关闭仿真...")

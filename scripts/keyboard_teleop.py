@@ -87,6 +87,9 @@ class KeyboardTeleop:
         self._vy = 0.0
         self._wz = 0.0
 
+        # 通知 scene1_patrol：键盘遥控已接管，停止发布零速
+        rospy.set_param('/keyboard_teleop/active', True)
+
         # ---- 按键诊断 ----
         self._last_key = ""       # 最近一次有效按键
         self._key_count = 0       # 累计按键次数
@@ -103,6 +106,12 @@ class KeyboardTeleop:
             "/odom", Odometry, self._odom_cb, queue_size=5
         )
 
+        # ---- 步态状态监测 ----
+        self._current_gait = "?"
+        self._gait_name_sub = rospy.Subscriber(
+            "/humanoid_mpc_gait_time_name", rospy.AnyMsg, self._gait_name_cb, queue_size=1
+        )
+
         # 等待首批数据
         rospy.loginfo("等待激光雷达和里程计数据...")
         waited = 0.0
@@ -115,12 +124,36 @@ class KeyboardTeleop:
         if self._latest_odom is None:
             rospy.logwarn("未收到里程计数据，将不显示角度")
 
+        # ---- 步态初始化：启用自动步态切换 ----
+        self._auto_gait_enabled = False
+        try:
+            from std_srvs.srv import SetBool
+            rospy.wait_for_service('/humanoid_mpc_auto_gait', timeout=5.0)
+            auto_gait_svc = rospy.ServiceProxy('/humanoid_mpc_auto_gait', SetBool)
+            resp = auto_gait_svc(True)
+            if resp.success:
+                self._auto_gait_enabled = True
+                rospy.loginfo("  自动步态切换已启用 — /cmd_vel 将自动触发 walk 模式")
+            else:
+                rospy.logwarn("  自动步态启用失败: %s", resp.message)
+        except Exception as e:
+            rospy.logwarn("  自动步态服务不可用 (%s)，/cmd_vel 可能无法触发行走", e)
+
     # ---- 回调 ----
     def _cloud_cb(self, msg):
         self._latest_cloud = msg
 
     def _odom_cb(self, msg):
         self._latest_odom = msg
+
+    def _gait_name_cb(self, msg):
+        """解析当前步态名称。"""
+        try:
+            # 尝试按已知类型解析
+            from kuavo_msgs.msg import gaitTimeName
+            self._current_gait = msg.gait_name
+        except (ImportError, AttributeError):
+            self._current_gait = "?"
 
     # ---- 按键处理 ----
     def process_key(self, key):
@@ -382,6 +415,7 @@ class KeyboardTeleop:
             state_parts.append(f"⚠靠近锥桶{cones[0][2]:.1f}m")
 
         state_parts.append(f"运动:{motion}")
+        state_parts.append(f"步态:{self._current_gait}")
         lines.append("  STATE      " + "  |  ".join(state_parts))
 
         lines.append("-" * 68)
@@ -435,6 +469,7 @@ class KeyboardTeleop:
 
         finally:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
+            rospy.delete_param('/keyboard_teleop/active')
             cmd = Twist()
             self._pub.publish(cmd)
             print("\n\n  已停止，退出。")
