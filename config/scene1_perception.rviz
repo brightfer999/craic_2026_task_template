@@ -1,0 +1,94 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+  - Class: rviz/Tool Properties
+    Name: Tool Properties
+
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Enabled: true
+      Plane Cell Count: 20
+      Cell Size: 1
+      Color: 96; 96; 96
+      Alpha: 0.5
+    - Class: rviz/TF
+      Name: TF
+      Enabled: true
+      Frame Timeout: 15
+      All Enabled: false
+      Frames:
+        base_link: true
+        odom: true
+      Show Axes: true
+      Show Arrows: true
+      Marker Scale: 0.3
+    - Class: rviz/Odometry
+      Name: Odometry
+      Enabled: true
+      Topic: /odom
+      Position Tolerance: 0.1
+      Angle Tolerance: 0.1
+      Keep: 500
+      Color: 0; 255; 0
+      Shaft Length: 0.2
+      Shaft Radius: 0.03
+      Head Length: 0.07
+      Head Radius: 0.06
+    - Class: rviz/PointCloud2
+      Name: Lidar Points
+      Enabled: true
+      Topic: /lidar/points
+      Style: Points
+      Size (Pixels): 3
+      Decay Time: 0.3
+      Color Transformer: Intensity
+      Use Rainbow: false
+      Color: 255; 180; 0
+      Alpha: 0.8
+    - Class: rviz/RobotModel
+      Name: Robot Model
+      Enabled: true
+      Robot Description: robot_description
+      Visual Enabled: true
+      Collision Enabled: false
+      Alpha: 0.7
+
+  Global Options:
+    Background Color: 40; 40; 40
+    Fixed Frame: odom
+    Frame Rate: 30
+
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 12
+      Focal Point: 3; 0; 0
+      Name: Top-down View
+      Pitch: 1.3
+      Yaw: 0
+    Saved:
+      - Class: rviz/Orbit
+        Distance: 12
+        Focal Point: 3; 0; 0
+        Name: Top-down View
+        Pitch: 1.3
+        Yaw: 0
+      - Class: rviz/Orbit
+        Distance: 8
+        Focal Point: 2; 0; 0.5
+        Name: Close Follow
+        Pitch: 0.8
+        Yaw: 0
+
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 900
+  Width: 1400
+  X: 50
+  Y: 50

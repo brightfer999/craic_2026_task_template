@@ -14,28 +14,35 @@ from .button_detector import ButtonDetector
 from .localizer import Localizer, PoseEstimate, AnchorObservation
 from .controller_manager import ControllerManager
 
+# 感知避障模块
+from .perception_avoidance import ObstacleDetector, AvoidanceController
+
 # 比赛要求模块
 from .competition_requirements import CompetitionRequirements, get_competition_requirements
 
 __all__ = [
     # 基础工具
-    'ROSInterface', 
-    'NavigationUtils', 
+    'ROSInterface',
+    'NavigationUtils',
     'PerceptionUtils',
-    
+
     # 感知模块
     'LidarMapper',
     'Clearance',
     'ButtonDetector',
-    
+
     # 定位模块
     'Localizer',
     'PoseEstimate',
     'AnchorObservation',
-    
+
     # 控制模块
     'ControllerManager',
-    
+
+    # 感知避障
+    'ObstacleDetector',
+    'AvoidanceController',
+
     # 比赛要求
     'CompetitionRequirements',
     'get_competition_requirements',
