@@ -65,13 +65,12 @@ CONE_DETECT_RANGE = 3.0      # 锥桶检测范围 (m)
 DISPLAY_LINES = 9
 
 
-def get_key(settings, timeout_val=0.05):
-    """非阻塞读取单个按键。"""
+def get_key(timeout_val=0.05):
+    """非阻塞读取单个按键（必须在 tty.setraw() 之后调用）。"""
     fd = sys.stdin.fileno()
     rlist, _, _ = select.select([fd], [], [], timeout_val)
     if rlist:
         key = os.read(fd, 1)
-        termios.tcsetattr(fd, termios.TCSADRAIN, settings)
         return key.decode() if isinstance(key, bytes) else key
     return ""
 
@@ -410,7 +409,7 @@ class KeyboardTeleop:
         try:
             while self._running and not rospy.is_shutdown():
                 # 1. 读取按键
-                key = get_key(settings)
+                key = get_key()
                 if key:
                     self.process_key(key)
 
