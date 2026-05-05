@@ -1,23 +1,16 @@
 #!/usr/bin/env python3.8
 """
-场景一：安全巡检任务脚本
+场景一：手动控制模式 — 仅启动仿真 + MPC 稳定，不做任何自主运动。
 
-路线：起点 → 障碍区 → 操作台1 → 复杂地形区 → 操作台2 → 斜坡区 → 台阶区 → 终点
-附加任务（可选）：终点 → 台阶区 → 斜坡区 → 复杂地形区 → 障碍区 → 起点
+用于配合键盘遥控 (keyboard_teleop.py) 进行数据采集。
 
 运行方式：
-  python3 scene1_patrol.py              # 使用默认种子
-  python3 scene1_patrol.py --seed 123   # 指定随机种子
+  python3 scripts/scene1_patrol.py              # 默认种子
+  python3 scripts/scene1_patrol.py --seed 42    # 指定种子
 
-可用接口：
-  - /cmd_vel (geometry_msgs/Twist)               发送速度指令: linear.x=前进, linear.y=侧移, angular.z=转向
-  - /kuavo_arm_traj (sensor_msgs/JointState)      手臂轨迹控制
-  - /lidar/points (sensor_msgs/PointCloud2)       雷达点云数据（局部实时建图/避障）
-  - /odom (nav_msgs/Odometry)                     阶段内相对里程计
-  - /tag_detections (apriltag_ros)                可选 AprilTag 语义锚点
-  - /sensors_data_raw (kuavo_msgs/sensorsData)    传感器原始数据（IMU、关节等）
-  - /humanoid_controller/switch_controller        切换控制器（mpc/amp_controller）
-  - GripperController (craic_simulator)           夹爪控制（用于按钮操作）
+然后另开终端：
+  python3 scripts/keyboard_teleop.py             # 手动遥控
+  python3 scripts/data_collector.py --output data/xxx.npz  # 采集数据
 """
 
 import os
@@ -29,8 +22,8 @@ from sim_launcher import SimLauncher
 
 
 def main():
-    parser = argparse.ArgumentParser(description="场景一：安全巡检")
-    parser.add_argument('--seed', type=int, default=0, help='随机种子（控制机器人初始位姿，默认0）')
+    parser = argparse.ArgumentParser(description="场景一：手动控制（仅启动仿真，不自主运动）")
+    parser.add_argument('--seed', type=int, default=0, help='随机种子（默认0）')
     args = parser.parse_args()
 
     launcher = SimLauncher(scene="scene1", seed=args.seed)
@@ -38,73 +31,42 @@ def main():
 
     import rospy
 
+    # 确保 skills 模块可导入
     script_dir = os.path.dirname(__file__)
-    if script_dir not in sys.path:
-        sys.path.insert(0, script_dir)
+    pkg_dir = os.path.dirname(script_dir)
+    if pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
 
-    from controller_manager import ControllerManager
-    from localization import Localizer
-    from state_machine import PatrolFSM
+    from skills.controller_manager import ControllerManager
 
-    rospy.loginfo("=== 场景一：安全巡检任务启动 ===")
-    rospy.loginfo("等待 MPC 控制器稳定机器人姿态...")
+    rospy.loginfo("=" * 60)
+    rospy.loginfo("  场景一：手动控制模式")
+    rospy.loginfo("=" * 60)
+
+    rospy.loginfo("  等待 MPC 控制器稳定机器人姿态 (18s)...")
     rospy.sleep(18.0)
 
     controller = ControllerManager()
-    controller.use_mpc()
-
-    localizer = Localizer()
-    ok = localizer.init_localize()
-    if not ok:
-        rospy.logwarn("相对里程计暂不可用，仍按雷达局部避障进行低速试探")
-
-    pose = localizer.get_pose()
-    rospy.loginfo(
-        "初始相对位姿: dx=%.2f dy=%.2f dyaw=%.2f (odom_valid=%s, anchor_valid=%s)",
-        pose.x,
-        pose.y,
-        pose.yaw,
-        pose.valid,
-        localizer.anchor_is_valid,
-    )
-
-    patrol = PatrolFSM(localizer, controller)
-    patrol.traverser.perform_startup_lidar_rotation()
-    patrol.traverser.perform_startup_lidar_rotation(duration=5.0, angular_z=0.34)
-
-    ok = patrol.traverser.initial_direction_check(timeout=8.0)
-    if not ok:
-        rospy.logwarn("开局方向不确定，请检查环境")
+    ok = controller.use_mpc()
+    if ok:
+        rospy.loginfo("  MPC 控制器已就绪")
     else:
-        rospy.loginfo("开局方向确认 OK")
+        rospy.logwarn("  MPC 切换失败，/cmd_vel 仍可被外部节点直接控制")
 
-    patrol.traverser.explore_and_detect_obstacles()
-    result = patrol.run()
+    rospy.loginfo("-" * 60)
+    rospy.loginfo("  仿真环境就绪，机器人保持静止。")
+    rospy.loginfo("  请在另一个终端运行键盘遥控或自动避障脚本：")
+    rospy.loginfo("    python3 scripts/keyboard_teleop.py")
+    rospy.loginfo("    python3 scripts/data_collector.py --output data/scene1_frames.npz")
+    rospy.loginfo("  按 Ctrl+C 退出仿真")
+    rospy.loginfo("-" * 60)
 
-    if patrol.traverser.no_cone_abort:
-        rospy.logwarn("Obstacle U-turn retry disabled; keep current forward direction")
-        patrol.traverser.no_cone_abort = False
-
-    rospy.loginfo(
-        "场景一主任务完成=%s，用时=%.1fs，失败阶段=%s",
-        result.completed,
-        result.elapsed_time,
-        result.failed_states,
-    )
-
-    if patrol.should_attempt_extra(result):
-        rospy.loginfo("满足附加任务条件，开始反向巡检")
-        extra_result = patrol.run_reverse()
-        rospy.loginfo(
-            "场景一附加任务完成=%s，用时=%.1fs，失败阶段=%s",
-            extra_result.completed,
-            extra_result.elapsed_time,
-            extra_result.failed_states,
-        )
-    else:
-        rospy.loginfo("不满足附加任务条件，停在终点")
-
-    controller.stop_robot(1.0)
+    try:
+        rate = rospy.Rate(10)
+        while not rospy.is_shutdown():
+            rate.sleep()
+    except KeyboardInterrupt:
+        rospy.loginfo("  收到停止信号，关闭仿真...")
 
 
 if __name__ == '__main__':
