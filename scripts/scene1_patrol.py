@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.8
+#!/usr/bin/env python3
 """
 场景一：手动控制模式 — 仅启动仿真 + MPC 稳定，不做任何自主运动。
 
@@ -30,6 +30,7 @@ def main():
     launcher.start(node_name="scene1_patrol")
 
     import rospy
+    from geometry_msgs.msg import Twist
 
     # 确保 skills 模块可导入
     script_dir = os.path.dirname(__file__)
@@ -53,17 +54,25 @@ def main():
     else:
         rospy.logwarn("  MPC 切换失败，/cmd_vel 仍可被外部节点直接控制")
 
+    # 创建 cmd_vel publisher，持续发布零速以保持机器人静止
+    # 这确保即使 MPC 切换失败，机器人也不会自主运动
+    cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+    rospy.sleep(0.5)  # 等待 publisher 注册到 master
+
     rospy.loginfo("-" * 60)
     rospy.loginfo("  仿真环境就绪，机器人保持静止。")
+    rospy.loginfo("  持续发布零速 /cmd_vel，直到外部节点 (键盘/自动) 接管。")
     rospy.loginfo("  请在另一个终端运行键盘遥控或自动避障脚本：")
     rospy.loginfo("    python3 scripts/keyboard_teleop.py")
     rospy.loginfo("    python3 scripts/data_collector.py --output data/scene1_frames.npz")
     rospy.loginfo("  按 Ctrl+C 退出仿真")
     rospy.loginfo("-" * 60)
 
+    zero_cmd = Twist()
     try:
-        rate = rospy.Rate(10)
+        rate = rospy.Rate(20)  # 20Hz，与 keyboard_teleop 同频
         while not rospy.is_shutdown():
+            cmd_pub.publish(zero_cmd)
             rate.sleep()
     except KeyboardInterrupt:
         rospy.loginfo("  收到停止信号，关闭仿真...")
