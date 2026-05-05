@@ -59,17 +59,17 @@
 
 ```bash
 # === 步骤 1：终端 1 — 启动仿真 ===
-cd ~/leju_kuavo_craic_2026/src/craic_task_template
+cd /root/kuavo_ws/src/craic_task_template
 python3 scripts/scene1_patrol.py --seed 0
 # 等待约 20s，看到 "仿真环境就绪，机器人保持静止" 即可
 
 # === 步骤 2：终端 2 — 启动键盘遥控 ===
-cd ~/leju_kuavo_craic_2026/src/craic_task_template
+cd /root/kuavo_ws/src/craic_task_template
 python3 scripts/keyboard_teleop.py
 # 看到多行显示界面即可开始操控
 
 # === 步骤 3：终端 3 — 启动数据采集 ===
-cd ~/leju_kuavo_craic_2026/src/craic_task_template
+cd /root/kuavo_ws/src/craic_task_template
 python3 scripts/data_collector.py --rate 10 --output data/场景名.npz
 # 看到 "数据采集器启动" 即开始记录
 ```
@@ -249,13 +249,13 @@ python3 scripts/data_collector.py --rate 10 --output data/场景名.npz
 
 终端会显示保存确认：
 ```
-  数据已保存: /home/btf/.../data/front_blocked.npz  (12.3 MB, 234 帧, 23.4 秒)
+  数据已保存: /root/kuavo_ws/.../data/front_blocked.npz  (12.3 MB, 234 帧, 23.4 秒)
 ```
 
 ### 文件存放位置
 
 ```
-~/leju_kuavo_craic_2026/src/craic_task_template/data/
+/root/kuavo_ws/src/craic_task_template/data/
 ├── straight_clear.npz
 ├── front_blocked_03_08m.npz
 ├── left_blocked_wall.npz
@@ -270,7 +270,7 @@ python3 scripts/data_collector.py --rate 10 --output data/场景名.npz
 ### 事后改名
 
 ```bash
-cd ~/leju_kuavo_craic_2026/src/craic_task_template/data
+cd /root/kuavo_ws/src/craic_task_template/data
 
 # 如果采集时忘了指定 --output，默认文件名带时间戳：
 ls scene1_frames_*.npz
