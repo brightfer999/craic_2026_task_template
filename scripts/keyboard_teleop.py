@@ -62,7 +62,7 @@ CONE_CLUSTER_DIAMETER = 0.55  # BFS 邻近距离阈值 (m)
 CONE_DETECT_RANGE = 3.0      # 锥桶检测范围 (m)
 
 # 显示行数 (用于 ANSI 光标上移)
-DISPLAY_LINES = 8
+DISPLAY_LINES = 9
 
 
 def get_key(settings, timeout_val=0.05):
@@ -87,6 +87,10 @@ class KeyboardTeleop:
         self._vx = 0.0
         self._vy = 0.0
         self._wz = 0.0
+
+        # ---- 按键诊断 ----
+        self._last_key = ""       # 最近一次有效按键
+        self._key_count = 0       # 累计按键次数
 
         # ---- 激光雷达数据 ----
         self._latest_cloud = None
@@ -121,6 +125,13 @@ class KeyboardTeleop:
 
     # ---- 按键处理 ----
     def process_key(self, key):
+        # 诊断：记录每次有效按键
+        if key and key != "\x03":
+            self._last_key = key
+            self._key_count += 1
+            if self._key_count == 1:
+                rospy.loginfo("  检测到首次按键 '%s' — 键盘输入正常工作", key)
+
         if key == "w":
             self._vx = self._speed
             self._wz = 0.0
@@ -375,7 +386,12 @@ class KeyboardTeleop:
         lines.append("  STATE      " + "  |  ".join(state_parts))
 
         lines.append("-" * 68)
-        lines.append("  w/x:前后  a/d:转向  q/e:横移  s:停  Space:变速  Ctrl+C:退出")
+        # 按键提示 + 诊断
+        if self._last_key:
+            key_disp = f"最后按键: [{self._last_key}] (共{self._key_count}次)"
+        else:
+            key_disp = "等待按键输入..."
+        lines.append(f"  w/x:前后  a/d:转向  q/e:横移  s:停  Space:变速  Ctrl+C:退出  |  {key_disp}")
         lines.append("=" * 68)
 
         return "\r\n".join(lines)
