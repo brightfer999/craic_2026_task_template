@@ -28,6 +28,7 @@ class StageDirective:
     completion_tags: Tuple[int, ...] = ()
     corridor_bias: float = 0.0
     description: str = ""
+    use_dwa: bool = False  # Phase 2: enable DWA local planner for this stage
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ FORWARD_STAGES = [
         timeout=85.0,
         speed=0.20,
         description="Cross the obstacle area with local lidar avoidance.",
+        use_dwa=True,
     ),
     StageDirective(
         name="operator_1",
@@ -126,6 +128,28 @@ FORWARD_STAGES = [
         speed=0.12,
         completion_tags=(6,),
         description="Enter the finish area and stop.",
+    ),
+]
+
+
+SEED0_OBSTACLE_STAGES = [
+    StageDirective(
+        name="leave_start",
+        controller="mpc",
+        nominal_distance=1.8,
+        timeout=35.0,
+        speed=0.16,
+        corridor_bias=0.15,
+        description="Leave the start area with lidar corridor following.",
+    ),
+    StageDirective(
+        name="obstacle",
+        controller="mpc",
+        nominal_distance=5.0,
+        timeout=95.0,
+        speed=0.16,
+        description="Cross the seed0 obstacle area using robot-local lidar gap following.",
+        use_dwa=True,
     ),
 ]
 
